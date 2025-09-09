@@ -19,7 +19,6 @@
 #import "sqlite3.h"
 #endif
 
-
 static const NSUInteger kMaxErrorRetryCount = 8;
 static const NSTimeInterval kMinRetryTimeInterval = 2.0;
 static const int kPathLengthMax = PATH_MAX - 64;
@@ -28,7 +27,6 @@ static NSString *const kDBShmFileName = @"manifest.sqlite-shm";
 static NSString *const kDBWalFileName = @"manifest.sqlite-wal";
 static NSString *const kDataDirectoryName = @"data";
 static NSString *const kTrashDirectoryName = @"trash";
-
 
 /*
  File:
@@ -41,7 +39,7 @@ static NSString *const kTrashDirectoryName = @"trash";
            /e10adc3949ba59abbe56e057f20f883e
       /trash/
             /unused_file_or_folder
- 
+
  SQL:
  create table if not exists manifest (
     key                 text,
@@ -52,17 +50,17 @@ static NSString *const kTrashDirectoryName = @"trash";
     last_access_time    integer,
     extended_data       blob,
     primary key(key)
- ); 
+ );
  create index if not exists last_access_time_idx on manifest(last_access_time);
  */
 
 /// Returns nil in App Extension.
-static UIApplication *_YYSharedApplication() {
+static UIApplication *_YYSharedApplication(void) {
     static BOOL isAppExtension = NO;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         Class cls = NSClassFromString(@"UIApplication");
-        if(!cls || ![cls respondsToSelector:@selector(sharedApplication)]) isAppExtension = YES;
+        if (!cls || ![cls respondsToSelector:@selector(sharedApplication)]) isAppExtension = YES;
         if ([[[NSBundle mainBundle] bundlePath] hasSuffix:@".appex"]) isAppExtension = YES;
     });
 #pragma clang diagnostic push
@@ -71,30 +69,28 @@ static UIApplication *_YYSharedApplication() {
 #pragma clang diagnostic pop
 }
 
-
 @implementation YYKVStorageItem
 @end
 
 @implementation YYKVStorage {
     dispatch_queue_t _trashQueue;
-    
+
     NSString *_path;
     NSString *_dbPath;
     NSString *_dataPath;
     NSString *_trashPath;
-    
+
     sqlite3 *_db;
     CFMutableDictionaryRef _dbStmtCache;
     NSTimeInterval _dbLastOpenErrorTime;
     NSUInteger _dbOpenErrorCount;
 }
 
-
 #pragma mark - db
 
 - (BOOL)_dbOpen {
     if (_db) return YES;
-    
+
     int result = sqlite3_open(_dbPath.UTF8String, &_db);
     if (result == SQLITE_OK) {
         CFDictionaryKeyCallBacks keyCallbacks = kCFCopyStringDictionaryKeyCallBacks;
@@ -109,7 +105,7 @@ static UIApplication *_YYSharedApplication() {
         _dbStmtCache = NULL;
         _dbLastOpenErrorTime = CACurrentMediaTime();
         _dbOpenErrorCount++;
-        
+
         if (_errorLogsEnabled) {
             NSLog(@"%s line:%d sqlite open failed (%d).", __FUNCTION__, __LINE__, result);
         }
@@ -117,16 +113,23 @@ static UIApplication *_YYSharedApplication() {
     }
 }
 
+static void _finalizeStatement(const void *key, const void *value, void *context) {
+    sqlite3_finalize((sqlite3_stmt *)value);
+}
+
 - (BOOL)_dbClose {
     if (!_db) return YES;
-    
-    int  result = 0;
+
+    int result = 0;
     BOOL retry = NO;
     BOOL stmtFinalized = NO;
-    
-    if (_dbStmtCache) CFRelease(_dbStmtCache);
+
+    if (_dbStmtCache) {
+        CFDictionaryApplyFunction(_dbStmtCache, _finalizeStatement, NULL);
+        CFRelease(_dbStmtCache);
+    }
     _dbStmtCache = NULL;
-    
+
     do {
         retry = NO;
         result = sqlite3_close(_db);
@@ -169,20 +172,23 @@ static UIApplication *_YYSharedApplication() {
 - (void)_dbCheckpoint {
     if (![self _dbCheck]) return;
     // Cause a checkpoint to occur, merge `sqlite-wal` file to `sqlite` file.
-    sqlite3_wal_checkpoint(_db, NULL);
+    int result = sqlite3_wal_checkpoint(_db, NULL);
+    if (result != SQLITE_OK && _errorLogsEnabled) {
+        NSLog(@"%s line:%d sqlite WAL checkpoint error (%d)", __FUNCTION__, __LINE__, result);
+    }
 }
 
 - (BOOL)_dbExecute:(NSString *)sql {
     if (sql.length == 0) return NO;
     if (![self _dbCheck]) return NO;
-    
+
     char *error = NULL;
     int result = sqlite3_exec(_db, sql.UTF8String, NULL, NULL, &error);
     if (error) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite exec error (%d): %s", __FUNCTION__, __LINE__, result, error);
         sqlite3_free(error);
     }
-    
+
     return result == SQLITE_OK;
 }
 
@@ -197,14 +203,21 @@ static UIApplication *_YYSharedApplication() {
         }
         CFDictionarySetValue(_dbStmtCache, (__bridge const void *)(sql), stmt);
     } else {
-        sqlite3_reset(stmt);
+        if (sqlite3_stmt_busy(stmt)) {
+            // just in case someone will forget to sqlite3_reset cached statement
+            // causing WAL file lock
+            if (_errorLogsEnabled) {
+                NSLog(@"%s line:%d WARN: cached statement for query \"%@\" was not reset.", __FUNCTION__, __LINE__, sql);
+            }
+            sqlite3_reset(stmt);
+        }
     }
     return stmt;
 }
 
 - (NSString *)_dbJoinedKeys:(NSArray *)keys {
     NSMutableString *string = [NSMutableString new];
-    for (NSUInteger i = 0,max = keys.count; i < max; i++) {
+    for (NSUInteger i = 0, max = keys.count; i < max; i++) {
         [string appendString:@"?"];
         if (i + 1 != max) {
             [string appendString:@","];
@@ -213,7 +226,7 @@ static UIApplication *_YYSharedApplication() {
     return string;
 }
 
-- (void)_dbBindJoinedKeys:(NSArray *)keys stmt:(sqlite3_stmt *)stmt fromIndex:(int)index{
+- (void)_dbBindJoinedKeys:(NSArray *)keys stmt:(sqlite3_stmt *)stmt fromIndex:(int)index {
     for (int i = 0, max = (int)keys.count; i < max; i++) {
         NSString *key = keys[i];
         sqlite3_bind_text(stmt, index + i, key.UTF8String, -1, NULL);
@@ -224,7 +237,7 @@ static UIApplication *_YYSharedApplication() {
     NSString *sql = @"insert or replace into manifest (key, filename, size, inline_data, modification_time, last_access_time, extended_data) values (?1, ?2, ?3, ?4, ?5, ?6, ?7);";
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return NO;
-    
+
     int timestamp = (int)time(NULL);
     sqlite3_bind_text(stmt, 1, key.UTF8String, -1, NULL);
     sqlite3_bind_text(stmt, 2, fileName.UTF8String, -1, NULL);
@@ -237,8 +250,9 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_bind_int(stmt, 5, timestamp);
     sqlite3_bind_int(stmt, 6, timestamp);
     sqlite3_bind_blob(stmt, 7, extendedData.bytes, (int)extendedData.length, 0);
-    
+
     int result = sqlite3_step(stmt);
+    sqlite3_reset(stmt);
     if (result != SQLITE_DONE) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite insert error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return NO;
@@ -253,6 +267,7 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_bind_int(stmt, 1, (int)time(NULL));
     sqlite3_bind_text(stmt, 2, key.UTF8String, -1, NULL);
     int result = sqlite3_step(stmt);
+    sqlite3_reset(stmt);
     if (result != SQLITE_DONE) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite update error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return NO;
@@ -263,15 +278,15 @@ static UIApplication *_YYSharedApplication() {
 - (BOOL)_dbUpdateAccessTimeWithKeys:(NSArray *)keys {
     if (![self _dbCheck]) return NO;
     int t = (int)time(NULL);
-     NSString *sql = [NSString stringWithFormat:@"update manifest set last_access_time = %d where key in (%@);", t, [self _dbJoinedKeys:keys]];
-    
+    NSString *sql = [NSString stringWithFormat:@"update manifest set last_access_time = %d where key in (%@);", t, [self _dbJoinedKeys:keys]];
+
     sqlite3_stmt *stmt = NULL;
     int result = sqlite3_prepare_v2(_db, sql.UTF8String, -1, &stmt, NULL);
     if (result != SQLITE_OK) {
-        if (_errorLogsEnabled)  NSLog(@"%s line:%d sqlite stmt prepare error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
+        if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite stmt prepare error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return NO;
     }
-    
+
     [self _dbBindJoinedKeys:keys stmt:stmt fromIndex:1];
     result = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -287,8 +302,9 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return NO;
     sqlite3_bind_text(stmt, 1, key.UTF8String, -1, NULL);
-    
+
     int result = sqlite3_step(stmt);
+    sqlite3_reset(stmt);
     if (result != SQLITE_DONE) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d db delete error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return NO;
@@ -298,14 +314,14 @@ static UIApplication *_YYSharedApplication() {
 
 - (BOOL)_dbDeleteItemWithKeys:(NSArray *)keys {
     if (![self _dbCheck]) return NO;
-    NSString *sql =  [NSString stringWithFormat:@"delete from manifest where key in (%@);", [self _dbJoinedKeys:keys]];
+    NSString *sql = [NSString stringWithFormat:@"delete from manifest where key in (%@);", [self _dbJoinedKeys:keys]];
     sqlite3_stmt *stmt = NULL;
     int result = sqlite3_prepare_v2(_db, sql.UTF8String, -1, &stmt, NULL);
     if (result != SQLITE_OK) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite stmt prepare error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return NO;
     }
-    
+
     [self _dbBindJoinedKeys:keys stmt:stmt fromIndex:1];
     result = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -322,6 +338,7 @@ static UIApplication *_YYSharedApplication() {
     if (!stmt) return NO;
     sqlite3_bind_int(stmt, 1, size);
     int result = sqlite3_step(stmt);
+    sqlite3_reset(stmt);
     if (result != SQLITE_DONE) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite delete error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return NO;
@@ -335,8 +352,9 @@ static UIApplication *_YYSharedApplication() {
     if (!stmt) return NO;
     sqlite3_bind_int(stmt, 1, time);
     int result = sqlite3_step(stmt);
+    sqlite3_reset(stmt);
     if (result != SQLITE_DONE) {
-        if (_errorLogsEnabled)  NSLog(@"%s line:%d sqlite delete error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
+        if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite delete error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return NO;
     }
     return YES;
@@ -353,7 +371,7 @@ static UIApplication *_YYSharedApplication() {
     int last_access_time = sqlite3_column_int(stmt, i++);
     const void *extended_data = sqlite3_column_blob(stmt, i);
     int extended_data_bytes = sqlite3_column_bytes(stmt, i++);
-    
+
     YYKVStorageItem *item = [YYKVStorageItem new];
     if (key) item.key = [NSString stringWithUTF8String:key];
     if (filename && *filename != 0) item.filename = [NSString stringWithUTF8String:filename];
@@ -370,7 +388,7 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return nil;
     sqlite3_bind_text(stmt, 1, key.UTF8String, -1, NULL);
-    
+
     YYKVStorageItem *item = nil;
     int result = sqlite3_step(stmt);
     if (result == SQLITE_ROW) {
@@ -380,6 +398,7 @@ static UIApplication *_YYSharedApplication() {
             if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite query error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         }
     }
+    sqlite3_reset(stmt);
     return item;
 }
 
@@ -391,14 +410,14 @@ static UIApplication *_YYSharedApplication() {
     } else {
         sql = [NSString stringWithFormat:@"select key, filename, size, inline_data, modification_time, last_access_time, extended_data from manifest where key in (%@)", [self _dbJoinedKeys:keys]];
     }
-    
+
     sqlite3_stmt *stmt = NULL;
     int result = sqlite3_prepare_v2(_db, sql.UTF8String, -1, &stmt, NULL);
     if (result != SQLITE_OK) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite stmt prepare error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return nil;
     }
-    
+
     [self _dbBindJoinedKeys:keys stmt:stmt fromIndex:1];
     NSMutableArray *items = [NSMutableArray new];
     do {
@@ -423,17 +442,19 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return nil;
     sqlite3_bind_text(stmt, 1, key.UTF8String, -1, NULL);
-    
+
     int result = sqlite3_step(stmt);
     if (result == SQLITE_ROW) {
         const void *inline_data = sqlite3_column_blob(stmt, 0);
         int inline_data_bytes = sqlite3_column_bytes(stmt, 0);
+        sqlite3_reset(stmt);
         if (!inline_data || inline_data_bytes <= 0) return nil;
         return [NSData dataWithBytes:inline_data length:inline_data_bytes];
     } else {
         if (result != SQLITE_DONE) {
             if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite query error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         }
+        sqlite3_reset(stmt);
         return nil;
     }
 }
@@ -447,6 +468,7 @@ static UIApplication *_YYSharedApplication() {
     if (result == SQLITE_ROW) {
         char *filename = (char *)sqlite3_column_text(stmt, 0);
         if (filename && *filename != 0) {
+            sqlite3_reset(stmt);
             return [NSString stringWithUTF8String:filename];
         }
     } else {
@@ -454,6 +476,7 @@ static UIApplication *_YYSharedApplication() {
             if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite query error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         }
     }
+    sqlite3_reset(stmt);
     return nil;
 }
 
@@ -466,7 +489,7 @@ static UIApplication *_YYSharedApplication() {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite stmt prepare error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return nil;
     }
-    
+
     [self _dbBindJoinedKeys:keys stmt:stmt fromIndex:1];
     NSMutableArray *filenames = [NSMutableArray new];
     do {
@@ -494,7 +517,7 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return nil;
     sqlite3_bind_int(stmt, 1, size);
-    
+
     NSMutableArray *filenames = [NSMutableArray new];
     do {
         int result = sqlite3_step(stmt);
@@ -512,6 +535,7 @@ static UIApplication *_YYSharedApplication() {
             break;
         }
     } while (1);
+    sqlite3_reset(stmt);
     return filenames;
 }
 
@@ -520,7 +544,7 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return nil;
     sqlite3_bind_int(stmt, 1, time);
-    
+
     NSMutableArray *filenames = [NSMutableArray new];
     do {
         int result = sqlite3_step(stmt);
@@ -538,6 +562,7 @@ static UIApplication *_YYSharedApplication() {
             break;
         }
     } while (1);
+    sqlite3_reset(stmt);
     return filenames;
 }
 
@@ -546,7 +571,7 @@ static UIApplication *_YYSharedApplication() {
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return nil;
     sqlite3_bind_int(stmt, 1, count);
-    
+
     NSMutableArray *items = [NSMutableArray new];
     do {
         int result = sqlite3_step(stmt);
@@ -570,6 +595,7 @@ static UIApplication *_YYSharedApplication() {
             break;
         }
     } while (1);
+    sqlite3_reset(stmt);
     return items;
 }
 
@@ -581,9 +607,12 @@ static UIApplication *_YYSharedApplication() {
     int result = sqlite3_step(stmt);
     if (result != SQLITE_ROW) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite query error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
+        sqlite3_reset(stmt);
         return -1;
     }
-    return sqlite3_column_int(stmt, 0);
+    int count = sqlite3_column_int(stmt, 0);
+    sqlite3_reset(stmt);
+    return count;
 }
 
 - (int)_dbGetTotalItemSize {
@@ -593,9 +622,12 @@ static UIApplication *_YYSharedApplication() {
     int result = sqlite3_step(stmt);
     if (result != SQLITE_ROW) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite query error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
+        sqlite3_reset(stmt);
         return -1;
     }
-    return sqlite3_column_int(stmt, 0);
+    int size = sqlite3_column_int(stmt, 0);
+    sqlite3_reset(stmt);
+    return size;
 }
 
 - (int)_dbGetTotalItemCount {
@@ -607,9 +639,10 @@ static UIApplication *_YYSharedApplication() {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite query error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
         return -1;
     }
-    return sqlite3_column_int(stmt, 0);
+    int count = sqlite3_column_int(stmt, 0);
+    sqlite3_reset(stmt);
+    return count;
 }
-
 
 #pragma mark - file
 
@@ -655,7 +688,6 @@ static UIApplication *_YYSharedApplication() {
     });
 }
 
-
 #pragma mark - private
 
 /**
@@ -686,7 +718,7 @@ static UIApplication *_YYSharedApplication() {
         NSLog(@"YYKVStorage init error: invalid type: %lu.", (unsigned long)type);
         return nil;
     }
-    
+
     self = [super init];
     _path = path.copy;
     _type = type;
@@ -711,7 +743,7 @@ static UIApplication *_YYSharedApplication() {
         NSLog(@"YYKVStorage init error:%@", error);
         return nil;
     }
-    
+
     if (![self _dbOpen] || ![self _dbInitialize]) {
         // db file may broken...
         [self _dbClose];
@@ -747,7 +779,7 @@ static UIApplication *_YYSharedApplication() {
     if (_type == YYKVStorageTypeFile && filename.length == 0) {
         return NO;
     }
-    
+
     if (filename.length) {
         if (![self _fileWriteWithName:filename data:value]) {
             return NO;
@@ -782,7 +814,8 @@ static UIApplication *_YYSharedApplication() {
             }
             return [self _dbDeleteItemWithKey:key];
         } break;
-        default: return NO;
+        default:
+            return NO;
     }
 }
 
@@ -800,14 +833,15 @@ static UIApplication *_YYSharedApplication() {
             }
             return [self _dbDeleteItemWithKeys:keys];
         } break;
-        default: return NO;
+        default:
+            return NO;
     }
 }
 
 - (BOOL)removeItemsLargerThanSize:(int)size {
     if (size == INT_MAX) return YES;
     if (size <= 0) return [self removeAllItems];
-    
+
     switch (_type) {
         case YYKVStorageTypeSQLite: {
             if ([self _dbDeleteItemsWithSizeLargerThan:size]) {
@@ -833,7 +867,7 @@ static UIApplication *_YYSharedApplication() {
 - (BOOL)removeItemsEarlierThanTime:(int)time {
     if (time <= 0) return YES;
     if (time == INT_MAX) return [self removeAllItems];
-    
+
     switch (_type) {
         case YYKVStorageTypeSQLite: {
             if ([self _dbDeleteItemsWithTimeEarlierThan:time]) {
@@ -859,11 +893,11 @@ static UIApplication *_YYSharedApplication() {
 - (BOOL)removeItemsToFitSize:(int)maxSize {
     if (maxSize == INT_MAX) return YES;
     if (maxSize <= 0) return [self removeAllItems];
-    
+
     int total = [self _dbGetTotalItemSize];
     if (total < 0) return NO;
     if (total <= maxSize) return YES;
-    
+
     NSArray *items = nil;
     BOOL suc = NO;
     do {
@@ -889,11 +923,11 @@ static UIApplication *_YYSharedApplication() {
 - (BOOL)removeItemsToFitCount:(int)maxCount {
     if (maxCount == INT_MAX) return YES;
     if (maxCount <= 0) return [self removeAllItems];
-    
+
     int total = [self _dbGetTotalItemCount];
     if (total < 0) return NO;
     if (total <= maxCount) return YES;
-    
+
     NSArray *items = nil;
     BOOL suc = NO;
     do {
@@ -924,9 +958,8 @@ static UIApplication *_YYSharedApplication() {
     return YES;
 }
 
-- (void)removeAllItemsWithProgressBlock:(void(^)(int removedCount, int totalCount))progress
-                               endBlock:(void(^)(BOOL error))end {
-    
+- (void)removeAllItemsWithProgressBlock:(void (^)(int removedCount, int totalCount))progress
+                               endBlock:(void (^)(BOOL error))end {
     int total = [self _dbGetTotalItemCount];
     if (total <= 0) {
         if (end) end(total < 0);
